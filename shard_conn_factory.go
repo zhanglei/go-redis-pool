@@ -8,25 +8,37 @@ import (
 	redis "github.com/go-redis/redis/v7"
 )
 
+const (
+	// DistributeByModular selects the sharding factory by modular
+	DistributeByModular = iota + 1
+	// DistributeByConsistenceModular selects the sharding factory by consistence modular
+	DistributeByConsistenceModular
+)
+
 var (
 	errMoreThanOneParam      = errors.New("the number of params shouldn't be greater than 1")
 	errPartialCommandFailure = errors.New("partital failure in command")
 )
 
 type ShardConfig struct {
-	Shards []*HAConfig
-	HashFn func(key []byte) uint32
+	Shards         []*HAConfig
+	DistributeType int
+	HashFn         func(key []byte) uint32
 }
 
 type ShardConnFactory struct {
 	cfg    *ShardConfig
 	shards []*HAConnFactory
+	ring   *ring
 }
 
 func NewShardConnFactory(cfg *ShardConfig) (*ShardConnFactory, error) {
 	factory := &ShardConnFactory{
 		cfg:    cfg,
 		shards: make([]*HAConnFactory, len(cfg.Shards)),
+	}
+	if factory.cfg.DistributeType < DistributeByModular || factory.cfg.DistributeType > DistributeByConsistenceModular {
+		cfg.DistributeType = DistributeByModular
 	}
 	var err error
 	for i, shard := range cfg.Shards {
@@ -37,12 +49,30 @@ func NewShardConnFactory(cfg *ShardConfig) (*ShardConnFactory, error) {
 	if factory.cfg.HashFn == nil {
 		factory.cfg.HashFn = crc32.ChecksumIEEE
 	}
+	if cfg.DistributeType == DistributeByConsistenceModular {
+		factory.ring = NewRing(factory.cfg.HashFn)
+		for idx, shard := range factory.shards {
+			factory.ring.Add(shard.cfg.Master, idx)
+		}
+	}
 	return factory, nil
 }
 
 func (factory *ShardConnFactory) close() {
 	for _, shard := range factory.shards {
+		if factory.cfg.DistributeType == DistributeByConsistenceModular {
+			factory.ring.Remove(shard.cfg.Master)
+		}
 		shard.close()
+	}
+}
+
+func (factory *ShardConnFactory) getShardIndex(key string) uint32 {
+	switch factory.cfg.DistributeType {
+	case DistributeByConsistenceModular:
+		return uint32(factory.ring.Hash(key))
+	default:
+		return factory.cfg.HashFn([]byte(key)) % uint32(len(factory.shards))
 	}
 }
 
@@ -53,7 +83,7 @@ func (factory *ShardConnFactory) getSlaveConn(key ...string) (*redis.Client, err
 	var ind uint32
 	ind = 0
 	if len(key) > 0 {
-		ind = factory.cfg.HashFn([]byte(key[0])) % uint32(len(factory.shards))
+		ind = factory.getShardIndex(key[0])
 	}
 	return factory.shards[ind].getSlaveConn()
 }
@@ -65,7 +95,7 @@ func (factory *ShardConnFactory) getMasterConn(key ...string) (*redis.Client, er
 	var ind uint32
 	ind = 0
 	if len(key) > 0 {
-		ind = factory.cfg.HashFn([]byte(key[0])) % uint32(len(factory.shards))
+		ind = factory.getShardIndex(key[0])
 	}
 	return factory.shards[ind].getMasterConn()
 }
@@ -73,7 +103,7 @@ func (factory *ShardConnFactory) getMasterConn(key ...string) (*redis.Client, er
 func (factory *ShardConnFactory) groupKeysByInd(keys ...string) map[uint32][]string {
 	index2Keys := make(map[uint32][]string, 0)
 	for i := 0; i < len(keys); i++ {
-		ind := factory.cfg.HashFn([]byte(keys[i])) % uint32(len(factory.shards))
+		ind := factory.getShardIndex(keys[i])
 		if _, exists := index2Keys[ind]; !exists {
 			index2Keys[ind] = make([]string, 0)
 		}
@@ -85,7 +115,7 @@ func (factory *ShardConnFactory) groupKeysByInd(keys ...string) map[uint32][]str
 func (factory *ShardConnFactory) isCrossMultiShards(keys ...string) bool {
 	var ind uint32
 	for i := 0; i < len(keys); i++ {
-		newInd := factory.cfg.HashFn([]byte(keys[i])) % uint32(len(factory.shards))
+		newInd := factory.getShardIndex(keys[i])
 		if i == 0 {
 			ind = newInd
 		} else if newInd != ind {
